@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+SQLAlchemy
+pydantic
+pydantic[email]
+faker
+requests
+python-dotenv
