@@ -6,7 +6,7 @@ from sqlalchemy import select
 
 # ---------- STUDENT CRUD ----------
 def create_student(db: Session, student: schemas.StudentCreate) -> models.Student:
-    db_student = models.Student(**student.model_dump())  # pydantic -> dict (v2)
+    db_student = models.Student(**student.model_dump())
     db.add(db_student)
     db.commit()
     db.refresh(db_student)
@@ -38,7 +38,6 @@ def list_students(db: Session, skip: int = 0, limit: int = 100) -> List[models.S
     return db.query(models.Student).offset(skip).limit(limit).all()
 
 def students_with_fee_due(db: Session, min_due: float = 0.0) -> List[models.Student]:
-    # Use SQL expression so it runs in DB (fee_total - fee_paid) >= min_due
     return db.query(models.Student).filter((models.Student.fee_total - models.Student.fee_paid) >= min_due).all()
 
 def students_unpaid(db: Session) -> List[models.Student]:
@@ -54,11 +53,10 @@ def students_by_grade(db: Session, grade: int) -> List[models.Student]:
 # ---------- TEACHER CRUD ----------
 def create_teacher(db: Session, teacher: schemas.TeacherCreate) -> models.Teacher:
     data = teacher.model_dump()
-    grades = data.pop("grades", None) or []
+    grades = data.pop("grades", []) or []
     db_teacher = models.Teacher(**data)
     db.add(db_teacher)
-    db.flush()  # get id assigned without committing
-    # assign grades
+    db.flush()
     for g in grades:
         db.add(models.GradeAssignment(teacher_id=db_teacher.id, grade=g))
     db.commit()
@@ -76,7 +74,6 @@ def update_teacher(db: Session, teacher_id: int, updates: dict) -> Optional[mode
     for k, v in updates.items():
         setattr(t, k, v)
     if grades is not None:
-        # clear existing assignments for this teacher
         db.query(models.GradeAssignment).filter(models.GradeAssignment.teacher_id == teacher_id).delete(synchronize_session=False)
         for g in grades:
             db.add(models.GradeAssignment(teacher_id=teacher_id, grade=g))
@@ -92,7 +89,8 @@ def delete_teacher(db: Session, teacher_id: int) -> bool:
     db.commit()
     return True
 
-# ---------- TEACHER queries ----------
+
+# ---------- TEACHER QUERIES ----------
 def list_teachers(db: Session, skip: int = 0, limit: int = 100) -> List[models.Teacher]:
     return db.query(models.Teacher).offset(skip).limit(limit).all()
 
@@ -104,9 +102,24 @@ def teachers_by_salary(db: Session, op: str, amount: float) -> List[models.Teach
     return []
 
 def teachers_for_grade(db: Session, grade: int) -> List[models.Teacher]:
-    # Find teacher ids from assignments and return teachers
     tas = db.query(models.GradeAssignment).filter(models.GradeAssignment.grade == grade).all()
     teacher_ids = [ta.teacher_id for ta in tas]
     if not teacher_ids:
         return []
     return db.query(models.Teacher).filter(models.Teacher.id.in_(teacher_ids)).all()
+
+
+# ---------- HELPERS TO CONVERT ORM -> Pydantic ----------
+
+def teacher_to_out(teacher: models.Teacher) -> schemas.TeacherOut:
+    """Convert ORM Teacher -> TeacherOut, converting grades to integers."""
+    grade_list = [g.grade for g in getattr(teacher, "grades", [])]
+    return schemas.TeacherOut(
+        id=teacher.id,
+        name=teacher.name,
+        email=teacher.email,
+        phone=teacher.phone,
+        subject=teacher.subject,
+        salary=teacher.salary,
+        grades=grade_list
+    )

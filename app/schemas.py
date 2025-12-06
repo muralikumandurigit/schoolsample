@@ -1,5 +1,5 @@
 # app/schemas.py
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr
 from typing import Optional, List
 from datetime import date
 
@@ -35,7 +35,6 @@ class StudentOut(StudentBase):
     id: int
     fee_due: float
 
-    # pydantic v2: allow reading attributes from ORM objects
     model_config = {"from_attributes": True}
 
 
@@ -48,7 +47,6 @@ class TeacherBase(BaseModel):
     salary: Optional[float] = 0.0
 
 class TeacherCreate(TeacherBase):
-    # allow specifying grades at creation time (list of grade numbers)
     grades: Optional[List[int]] = None
 
 class TeacherUpdate(BaseModel):
@@ -61,7 +59,22 @@ class TeacherUpdate(BaseModel):
 
 class TeacherOut(TeacherBase):
     id: int
-    # we'll return a list of grade integers in endpoints
     grades: List[int] = []
 
     model_config = {"from_attributes": True}
+
+    @classmethod
+    def from_orm(cls, obj):
+        """
+        Convert ORM Teacher object to TeacherOut.
+        Ensures 'grades' is a list of integers.
+        """
+        return cls(
+            id=obj.id,
+            name=obj.name,
+            email=obj.email,
+            phone=obj.phone,
+            subject=obj.subject,
+            salary=obj.salary,
+            grades=[g.grade if hasattr(g, 'grade') else g for g in getattr(obj, "grades", [])]
+        )

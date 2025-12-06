@@ -30,18 +30,22 @@ def rpc_error(msg_id, error):
 # ---------------------------------------------------
 # Serialization Helpers (ORM → JSON)
 # ---------------------------------------------------
-def serialize_student(student):
+def serialize_student(student: schemas.StudentOut):
     return schemas.StudentOut.model_validate(
         student, from_attributes=True
     ).model_dump(mode="json")
 
-def serialize_teacher(teacher):
-    data = schemas.TeacherOut.model_validate(
-        teacher, from_attributes=True
+def serialize_teacher(teacher: crud.models.Teacher):
+    """Convert Teacher ORM object to TeacherOut, mapping GradeAssignment → int."""
+    return schemas.TeacherOut(
+        id=teacher.id,
+        name=teacher.name,
+        email=teacher.email,
+        phone=teacher.phone,
+        subject=teacher.subject,
+        salary=teacher.salary,
+        grades=[g.grade for g in teacher.grades]  # convert ORM to int
     ).model_dump(mode="json")
-    # Convert GradeAssignment objects
-    data["grades"] = [g.grade for g in teacher.grades]
-    return data
 
 # ---------------------------------------------------
 #  MAIN WEBSOCKET ENDPOINT
@@ -64,7 +68,6 @@ async def websocket_handler(ws: WebSocket):
             # ======================================================
             #                     STUDENT METHODS
             # ======================================================
-
             if method == "students.create":
                 data = schemas.StudentCreate(**params)
                 s = crud.create_student(db_session, data)
@@ -100,7 +103,6 @@ async def websocket_handler(ws: WebSocket):
                     rpc_result(msg_id, [serialize_student(s) for s in students])
                 )
 
-            # Query endpoints
             elif method == "students.fee_due":
                 min_due = params.get("min_due", 0.0)
                 students = crud.students_with_fee_due(db_session, min_due)
@@ -130,7 +132,6 @@ async def websocket_handler(ws: WebSocket):
             # ======================================================
             #                     TEACHER METHODS
             # ======================================================
-
             elif method == "teachers.create":
                 data = schemas.TeacherCreate(**params)
                 t = crud.create_teacher(db_session, data)
