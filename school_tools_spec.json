@@ -1,0 +1,111 @@
+{
+  "tools": {
+    "students": {
+      "create": {
+        "type": "python_function",
+        "func": "crud.create_student",
+        "schema": "StudentCreate",
+        "serializer": "serialize_student",
+        "params": ["name", "email", "phone", "grade"]
+      },
+      "get": {
+        "type": "python_function",
+        "func": "crud.get_student",
+        "serializer": "serialize_student",
+        "id_param": "student_id",
+        "params": ["student_id"]
+      },
+      "update": {
+        "type": "python_function",
+        "func": "crud.update_student",
+        "schema": "StudentUpdate",
+        "serializer": "serialize_student",
+        "params": ["student_id", "name", "email", "phone", "grade", "fee_paid"]
+      },
+      "delete": {
+        "type": "python_function",
+        "func": "crud.delete_student",
+        "id_param": "student_id",
+        "params": ["student_id"]
+      },
+      "list": {
+        "type": "python_function",
+        "func": "crud.list_students",
+        "serializer": "serialize_student",
+        "params": ["skip", "limit"]
+      },
+      "fee_due": {
+        "type": "python_function",
+        "func": "crud.students_with_fee_due",
+        "serializer": "serialize_student",
+        "params": []
+      },
+      "unpaid": {
+        "type": "python_function",
+        "func": "crud.students_unpaid",
+        "serializer": "serialize_student",
+        "params": []
+      },
+      "partial_paid": {
+        "type": "python_function",
+        "func": "crud.students_partial_paid",
+        "serializer": "serialize_student",
+        "params": []
+      },
+      "by_grade": {
+        "type": "python_function",
+        "func": "crud.students_by_grade",
+        "serializer": "serialize_student",
+        "params": ["grade"]
+      }
+    },
+
+    "teachers": {
+      "create": {
+        "type": "python_function",
+        "func": "crud.create_teacher",
+        "schema": "TeacherCreate",
+        "serializer": "serialize_teacher",
+        "params": ["name", "email", "phone", "subject", "salary"]
+      },
+      "get": {
+        "type": "python_function",
+        "func": "crud.get_teacher",
+        "serializer": "serialize_teacher",
+        "id_param": "teacher_id",
+        "params": ["teacher_id"]
+      },
+      "update": {
+        "type": "python_function",
+        "func": "crud.update_teacher",
+        "schema": "TeacherUpdate",
+        "serializer": "serialize_teacher",
+        "params": ["teacher_id", "name", "email", "phone", "subject", "salary"]
+      },
+      "delete": {
+        "type": "python_function",
+        "func": "crud.delete_teacher",
+        "id_param": "teacher_id",
+        "params": ["teacher_id"]
+      },
+      "list": {
+        "type": "python_function",
+        "func": "crud.list_teachers",
+        "serializer": "serialize_teacher",
+        "params": ["skip", "limit"]
+      },
+      "by_salary": {
+        "type": "python_function",
+        "func": "crud.teachers_by_salary",
+        "serializer": "serialize_teacher",
+        "params": ["op", "amount"]
+      },
+      "by_grade": {
+        "type": "python_function",
+        "func": "crud.teachers_for_grade",
+        "serializer": "serialize_teacher",
+        "params": ["grade"]
+      }
+    }
+  }
+}

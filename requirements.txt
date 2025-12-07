@@ -6,3 +6,5 @@ pydantic[email]
 faker
 requests
 python-dotenv
+mcp
+httpx
