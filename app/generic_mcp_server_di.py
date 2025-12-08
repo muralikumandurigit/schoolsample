@@ -137,7 +137,6 @@ async def execute_script(spec: Dict[str, Any], args: Dict[str, Any], ctx: Dict[s
 async def execute_tool(spec: Dict[str, Any], args: Dict[str, Any], ctx: Dict[str, Any]):
     tool_type = spec.get("type", "python_function")
     if tool_type == "python_function":
-        # Run DB session in a thread
         def sync_call():
             with db_session_scope() as db:
                 local_ctx = dict(ctx)
@@ -161,15 +160,40 @@ class ToolRegistry:
 
     def _build(self):
         tools_section = self.spec.get("tools", {})
-        for tool_name, methods in tools_section.items():
-            if isinstance(methods, dict):
-                for method_name, method_spec in methods.items():
-                    fullname = f"{tool_name}.{method_name}"
-                    self.tools[fullname] = dict(method_spec)
-                    if "params" not in self.tools[fullname]:
-                        self.tools[fullname]["params"] = method_spec.get("params", [])
-            else:
-                self.tools[tool_name] = dict(methods)
+        for tool_name, group in tools_section.items():
+
+            # skip non-dict groups
+            if not isinstance(group, dict):
+                continue
+
+            for method_name, method_spec in group.items():
+                # skip group-level description
+                if method_name == "description":
+                    continue
+
+                fullname = f"{tool_name}.{method_name}"
+                safe_spec = self.normalize_method_spec(method_spec)
+                self.tools[fullname] = safe_spec
+
+    def normalize_method_spec(self, raw):
+        if not isinstance(raw, dict):
+            if isinstance(raw, str):
+                return {"description": raw}
+            return {}
+
+        allowed = {
+            "type", "func", "params", "schema", "serializer",
+            "method", "endpoint", "timeout", "path", "description", "id_param"
+        }
+        out = {}
+        for k, v in raw.items():
+            if k in allowed:
+                out[k] = v
+
+        if "params" not in out:
+            out["params"] = raw.get("params", [])
+
+        return out
 
     def list_tools(self):
         out = {}
@@ -214,7 +238,6 @@ def rpc_error(msg_id, code, message):
     return json.dumps({"id": msg_id, "error": {"code": code, "message": message}})
 
 # ---------------- WebSocket handler ----------------
-# ---------------- WebSocket handler implementing MCP standard methods ----------------
 async def ws_handler(websocket, registry: ToolRegistry, server_config: Dict[str, Any]):
     LOG.info("client connected")
     try:
@@ -284,7 +307,6 @@ async def ws_handler(websocket, registry: ToolRegistry, server_config: Dict[str,
         LOG.info("client disconnected")
     except Exception:
         LOG.exception("ws handler top-level error")
-
 
 # ---------------- server start helper ----------------
 def serve(spec: dict, host="0.0.0.0", port=8765):

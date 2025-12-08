@@ -8,3 +8,25 @@ requests
 python-dotenv
 mcp
 httpx
+
+# Speech recognition / Audio
+speechrecognition
+pyttsx3
+sounddevice
+soundfile
+faster-whisper
+noisereduce
+torch
+torchvision
+torchaudio
+silero-vad
+
+# MCP client dependencies
+websockets>=11.0
+httpx>=0.24.0
+
+# open-source LLM for local inference
+gpt4all>=1.5.0
+
+# optional helpers
+python-dotenv>=1.0.0
