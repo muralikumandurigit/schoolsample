@@ -1,144 +1,152 @@
 {
+  "websocket": {
+    "url": "ws://localhost:8000/ws"
+  },
+
   "tools": {
-    "students": {
-      "description": "Tools for managing student records in the school system, including CRUD operations, fee status queries, and filtering by grade.",
-
-      "create": {
-        "description": "Create a new student record in the system using the provided details.",
-        "type": "python_function",
-        "func": "crud.create_student",
-        "schema": "StudentCreate",
-        "serializer": "serialize_student",
-        "params": ["name", "email", "phone", "grade"]
-      },
-
-      "get": {
-        "description": "Fetch details of a specific student using their unique student ID.",
-        "type": "python_function",
-        "func": "crud.get_student",
-        "serializer": "serialize_student",
-        "id_param": "student_id",
-        "params": ["student_id"]
-      },
-
-      "update": {
-        "description": "Update an existing student's information, such as name, email, phone, grade or fee payment status.",
-        "type": "python_function",
-        "func": "crud.update_student",
-        "schema": "StudentUpdate",
-        "serializer": "serialize_student",
-        "params": ["student_id", "name", "email", "phone", "grade", "fee_paid"]
-      },
-
-      "delete": {
-        "description": "Remove a student record permanently using their ID.",
-        "type": "python_function",
-        "func": "crud.delete_student",
-        "id_param": "student_id",
-        "params": ["student_id"]
-      },
-
-      "list": {
-        "description": "Retrieve a paginated list of all students. Useful for browsing records.",
-        "type": "python_function",
-        "func": "crud.list_students",
-        "serializer": "serialize_student",
-        "params": ["skip", "limit"]
-      },
-
-      "fee_due": {
-        "description": "Get a list of all students who have pending fee payments (fee due = yes).",
-        "type": "python_function",
-        "func": "crud.students_with_fee_due",
-        "serializer": "serialize_student",
-        "params": []
-      },
-
-      "unpaid": {
-        "description": "List all students who have not paid any fees (fee_paid = 0 or false).",
-        "type": "python_function",
-        "func": "crud.students_unpaid",
-        "serializer": "serialize_student",
-        "params": []
-      },
-
-      "partial_paid": {
-        "description": "List students who have paid part of their fees, but not the full amount.",
-        "type": "python_function",
-        "func": "crud.students_partial_paid",
-        "serializer": "serialize_student",
-        "params": []
-      },
-
-      "by_grade": {
-        "description": "Retrieve all students belonging to a specific grade/class.",
-        "type": "python_function",
-        "func": "crud.students_by_grade",
-        "serializer": "serialize_student",
-        "params": ["grade"]
+    "students.create": {
+      "description": "Create a new student record in the school system.",
+      "type": "websocket",
+      "params": {
+        "name": "string",
+        "email": "string",
+        "phone": "string",
+        "grade": "string"
       }
     },
 
-    "teachers": {
-      "description": "Tools for managing teacher records, including CRUD operations, salary queries, and grade-based teacher filtering.",
+    "students.get": {
+      "description": "Fetch details of a student using their ID.",
+      "type": "websocket",
+      "params": {
+        "student_id": "integer"
+      }
+    },
 
-      "create": {
-        "description": "Create a new teacher record with personal and professional details.",
-        "type": "python_function",
-        "func": "crud.create_teacher",
-        "schema": "TeacherCreate",
-        "serializer": "serialize_teacher",
-        "params": ["name", "email", "phone", "subject", "salary"]
-      },
+    "students.update": {
+      "description": "Update student details including name, email, phone, grade or fee payment status.",
+      "type": "websocket",
+      "params": {
+        "student_id": "integer",
+        "updates": {
+          "name": "string?",
+          "email": "string?",
+          "phone": "string?",
+          "grade": "string?",
+          "fee_paid": "boolean?"
+        }
+      }
+    },
 
-      "get": {
-        "description": "Fetch details of a teacher using their unique teacher ID.",
-        "type": "python_function",
-        "func": "crud.get_teacher",
-        "serializer": "serialize_teacher",
-        "id_param": "teacher_id",
-        "params": ["teacher_id"]
-      },
+    "students.delete": {
+      "description": "Delete a student record by ID.",
+      "type": "websocket",
+      "params": {
+        "student_id": "integer"
+      }
+    },
 
-      "update": {
-        "description": "Update a teacher's profile including name, contact details, subject, or salary.",
-        "type": "python_function",
-        "func": "crud.update_teacher",
-        "schema": "TeacherUpdate",
-        "serializer": "serialize_teacher",
-        "params": ["teacher_id", "name", "email", "phone", "subject", "salary"]
-      },
+    "students.list": {
+      "description": "List all students with pagination.",
+      "type": "websocket",
+      "params": {
+        "skip": "integer?",
+        "limit": "integer?"
+      }
+    },
 
-      "delete": {
-        "description": "Delete a teacher's record from the system using their ID.",
-        "type": "python_function",
-        "func": "crud.delete_teacher",
-        "id_param": "teacher_id",
-        "params": ["teacher_id"]
-      },
+    "students.fee_due": {
+      "description": "List students who have pending fee payments.",
+      "type": "websocket",
+      "params": {}
+    },
 
-      "list": {
-        "description": "Retrieve a paginated list of teachers. Useful for browsing or admin panels.",
-        "type": "python_function",
-        "func": "crud.list_teachers",
-        "serializer": "serialize_teacher",
-        "params": ["skip", "limit"]
-      },
+    "students.unpaid": {
+      "description": "List students who have not paid any fees.",
+      "type": "websocket",
+      "params": {}
+    },
 
-      "by_salary": {
-        "description": "Fetch teachers filtered by salary comparison. 'op' is a comparison operator like >, <, >=, <=; 'amount' is salary value.",
-        "type": "python_function",
-        "func": "crud.teachers_by_salary",
-        "serializer": "serialize_teacher",
-        "params": ["op", "amount"]
-      },
+    "students.partial_paid": {
+      "description": "List students who have paid partially.",
+      "type": "websocket",
+      "params": {}
+    },
 
-      "by_grade": {
-        "description": "List all teachers associated with teaching a specific grade/class.",
-        "type": "python_function",
-        "func": "crud.teachers_for_grade",
-        "serializer": "serialize_teacher",
-        "params": ["grade"]
+    "students.by_grade": {
+      "description": "List students belonging to a specific grade.",
+      "type": "websocket",
+      "params": {
+        "grade": "string"
+      }
+    },
+
+    "teachers.create": {
+      "description": "Create a new teacher record.",
+      "type": "websocket",
+      "params": {
+        "name": "string",
+        "email": "string",
+        "phone": "string",
+        "subject": "string",
+        "salary": "number"
+      }
+    },
+
+    "teachers.get": {
+      "description": "Get teacher details by ID.",
+      "type": "websocket",
+      "params": {
+        "teacher_id": "integer"
+      }
+    },
+
+    "teachers.update": {
+      "description": "Update teacher details.",
+      "type": "websocket",
+      "params": {
+        "teacher_id": "integer",
+        "updates": {
+          "name": "string?",
+          "email": "string?",
+          "phone": "string?",
+          "subject": "string?",
+          "salary": "number?"
+        }
+      }
+    },
+
+    "teachers.delete": {
+      "description": "Delete a teacher record.",
+      "type": "websocket",
+      "params": {
+        "teacher_id": "integer"
+      }
+    },
+
+    "teachers.list": {
+      "description": "List teachers with pagination.",
+      "type": "websocket",
+      "params": {
+        "skip": "integer?",
+        "limit": "integer?"
+      }
+    },
+
+    "teachers.by_salary": {
+      "description": "List teachers filtered by salary comparison.",
+      "type": "websocket",
+      "params": {
+        "op": "string",
+        "amount": "number"
+      }
+    },
+
+    "teachers.by_grade": {
+      "description": "List teachers assigned to a grade.",
+      "type": "websocket",
+      "params": {
+        "grade": "string"
       }
     }
   }

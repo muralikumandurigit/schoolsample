@@ -1,18 +1,19 @@
 # app/generic_mcp_server_mcp.py
+
 import asyncio
 import importlib
 import inspect
 import json
 import logging
 import subprocess
+import uuid
 from contextlib import contextmanager
 from typing import Any, Dict, Optional
 
-import httpx
 import websockets
-from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
+from websockets.exceptions import ConnectionClosed
 
-# try to import MCP helpers if available
+# Optional MCP
 try:
     from mcp import types as mcp_types
     from mcp import schema as mcp_schema
@@ -22,307 +23,260 @@ except Exception:
     mcp_schema = None
     MCP_AVAILABLE = False
 
-# app helpers
-from app.ws_api import get_db  # DB context and serializers live in app.ws_api
+from app.ws_api import get_db
 
 LOG = logging.getLogger("generic_mcp_server_mcp")
 logging.basicConfig(level=logging.INFO)
 
-# ---------------- DB context helper (async-safe) ----------------
+# -----------------------------------------------------
+# DB SESSION SCOPE
+# -----------------------------------------------------
 @contextmanager
 def db_session_scope():
     with get_db() as db:
         yield db
 
-async def async_db_session_scope():
-    """Run synchronous DB session in a thread to avoid blocking event loop."""
-    return await asyncio.to_thread(lambda: db_session_scope())
-
-# ---------------- dynamic loaders ----------------
+# -----------------------------------------------------
+# PYTHON IMPORT HELPER
+# -----------------------------------------------------
 def load_python_callable(path: str):
     module_name, fn_name = path.rsplit(".", 1)
     module = importlib.import_module(f"app.{module_name}")
     return getattr(module, fn_name)
 
-def load_schema(schema_name: Optional[str]):
-    if not schema_name:
-        return None
-    module = importlib.import_module("app.schemas")
-    return getattr(module, schema_name)
+# -----------------------------------------------------
+# GLOBAL BACKEND WS (PERSISTENT)
+# -----------------------------------------------------
+WS_BACKEND: Optional[websockets.WebSocketClientProtocol] = None
+WS_READER_TASK: Optional[asyncio.Task] = None
+WS_PENDING: Dict[str, asyncio.Future] = {}
+WS_LOCK = asyncio.Lock()
+BACKEND_URL: Optional[str] = None
 
-def load_serializer(serializer_name: Optional[str]):
-    if not serializer_name:
-        return None
-    module = importlib.import_module("app.ws_api")
-    return getattr(module, serializer_name)
+# -----------------------------------------------------
+# HELPER: CHECK IF WS IS OPEN (websockets v12+)
+# -----------------------------------------------------
+def ws_is_open(ws):
+    return ws is not None and ws.state == websockets.protocol.State.OPEN
 
-# ---------------- executors ----------------
-async def execute_python_function(spec: Dict[str, Any], args: Dict[str, Any], ctx: Dict[str, Any]):
-    fn = load_python_callable(spec["func"])
-    serializer = load_serializer(spec.get("serializer"))
-    schema_name = spec.get("schema")
-    schema_cls = load_schema(schema_name) if schema_name else None
+# -----------------------------------------------------
+# BACKEND READER LOOP
+# -----------------------------------------------------
+async def backend_reader_loop():
+    global WS_BACKEND, WS_PENDING
+    ws = WS_BACKEND
+    LOG.info("Backend reader loop started")
+    try:
+        async for raw in ws:
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                LOG.warning("Non-JSON backend message discarded")
+                continue
 
-    kwargs: Dict[str, Any] = {}
+            msg_id = msg.get("id")
+            if not msg_id:
+                LOG.warning("Backend message missing id: %s", msg)
+                continue
 
-    if schema_cls:
+            fut = WS_PENDING.pop(msg_id, None)
+            if not fut:
+                LOG.warning("Unexpected backend response id=%s", msg_id)
+                continue
+
+            if "error" in msg:
+                fut.set_exception(RuntimeError(msg["error"]))
+            else:
+                fut.set_result(msg.get("result"))
+
+    except ConnectionClosed:
+        LOG.warning("Backend WS closed")
+    except Exception as e:
+        LOG.exception("Backend reader crashed: %s", e)
+    finally:
+        for mid, fut in list(WS_PENDING.items()):
+            if not fut.done():
+                fut.set_exception(RuntimeError("Backend connection lost"))
+            WS_PENDING.pop(mid, None)
+        LOG.warning("Backend reader loop finished")
+
+# -----------------------------------------------------
+# SINGLE BOOTSTRAP CONNECTOR — RUNS AT SERVER START
+# -----------------------------------------------------
+async def backend_ws_bootstrap():
+    """
+    Connect once at server startup and keep WS + reader running.
+    Auto-reconnects on drop.
+    """
+    global WS_BACKEND, WS_READER_TASK, BACKEND_URL
+    assert BACKEND_URL, "BACKEND_URL not set"
+
+    while True:
         try:
-            data_obj = schema_cls(**(args or {}))
+            LOG.info(f"[BOOT] Connecting to backend WebSocket: {BACKEND_URL}")
+            WS_BACKEND = await websockets.connect(BACKEND_URL)
+            WS_READER_TASK = asyncio.create_task(backend_reader_loop())
+            LOG.info("[BOOT] Backend connected successfully")
+            return
         except Exception as e:
-            raise ValueError(f"schema construction failed: {e}")
-        sig = inspect.signature(fn)
-        if "data" in sig.parameters:
-            kwargs["data"] = data_obj
-        else:
-            for pname in sig.parameters:
-                if pname in ("self", "cls"):
-                    continue
-                kwargs[pname] = data_obj
-                break
-    else:
-        kwargs.update(args or {})
+            LOG.error(f"[BOOT] Backend connect failed: {e}; retrying in 3s…")
+            await asyncio.sleep(3)
 
-    sig = inspect.signature(fn)
-    for name, p in sig.parameters.items():
-        if name not in kwargs and name in ctx:
-            kwargs[name] = ctx[name]
+# -----------------------------------------------------
+# SEND RPC TO BACKEND WS
+# -----------------------------------------------------
+async def send_backend_rpc(method: str, params: dict, timeout: int = 10):
+    global WS_BACKEND
+    if not ws_is_open(WS_BACKEND):
+        raise RuntimeError("Backend WebSocket not connected")
 
+    msg_id = uuid.uuid4().hex
+    fut = asyncio.get_running_loop().create_future()
+    WS_PENDING[msg_id] = fut
+    rpc_msg = {"id": msg_id, "method": method, "params": params}
+
+    try:
+        await WS_BACKEND.send(json.dumps(rpc_msg))
+    except Exception as e:
+        WS_PENDING.pop(msg_id, None)
+        raise RuntimeError(f"Send failed: {e}")
+
+    try:
+        return await asyncio.wait_for(fut, timeout=timeout)
+    except Exception:
+        WS_PENDING.pop(msg_id, None)
+        raise
+
+# -----------------------------------------------------
+# EXECUTE TOOL
+# -----------------------------------------------------
+async def execute_python_function(spec, args, ctx):
+    fn = load_python_callable(spec["func"])
+    kwargs = args.copy()
     try:
         if inspect.iscoroutinefunction(fn):
-            result = await fn(**kwargs)
+            return await fn(**kwargs)
         else:
             loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(None, lambda: fn(**kwargs))
+            return await loop.run_in_executor(None, lambda: fn(**kwargs))
     except Exception as e:
-        raise RuntimeError(f"python function error: {e}")
+        raise RuntimeError(f"python error: {e}")
 
-    if serializer:
-        if isinstance(result, list):
-            return [serializer(r) for r in result]
-        return serializer(result)
-    return result
-
-async def execute_external_api(spec: Dict[str, Any], args: Dict[str, Any], ctx: Dict[str, Any]):
-    method = spec.get("method", "GET").upper()
-    endpoint = spec["endpoint"]
-    timeout = spec.get("timeout", 10)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        if method == "GET":
-            resp = await client.get(endpoint, params=args)
-        else:
-            resp = await client.request(method, endpoint, json=args)
-        resp.raise_for_status()
-        try:
-            return resp.json()
-        except Exception:
-            return resp.text
-
-async def execute_script(spec: Dict[str, Any], args: Dict[str, Any], ctx: Dict[str, Any]):
+async def execute_script(spec, args, ctx):
     path = spec["path"]
-    params_list = [str(args.get(p, "")) for p in spec.get("params", [])]
-    proc = subprocess.run(
-        ["python", path, *params_list],
-        capture_output=True,
-        text=True,
-        timeout=spec.get("timeout", 60)
-    )
+    param_list = [str(args.get(p, "")) for p in spec.get("params", [])]
+    proc = subprocess.run(["python", path, *param_list], capture_output=True, text=True)
     if proc.returncode != 0:
-        raise RuntimeError(f"script failed: {proc.stderr.strip()}")
-    out = proc.stdout.strip()
+        raise RuntimeError(proc.stderr)
     try:
-        return json.loads(out) if out else None
-    except Exception:
-        return out
+        return json.loads(proc.stdout)
+    except:
+        return proc.stdout
 
-async def execute_tool(spec: Dict[str, Any], args: Dict[str, Any], ctx: Dict[str, Any]):
-    tool_type = spec.get("type", "python_function")
+async def execute_tool(name, spec, args, root_spec):
+    tool_type = spec.get("type")
+    if tool_type == "websocket":
+        timeout = spec.get("timeout", 10)
+        return await send_backend_rpc(name, args, timeout)
     if tool_type == "python_function":
-        def sync_call():
-            with db_session_scope() as db:
-                local_ctx = dict(ctx)
-                local_ctx["db"] = db
-                loop = asyncio.new_event_loop()
-                return loop.run_until_complete(execute_python_function(spec, args or {}, local_ctx))
-        return await asyncio.to_thread(sync_call)
-    elif tool_type == "external_api":
-        return await execute_external_api(spec, args or {}, ctx)
-    elif tool_type == "script":
-        return await execute_script(spec, args or {}, ctx)
-    else:
-        raise ValueError(f"unknown tool type: {tool_type}")
+        return await execute_python_function(spec, args, {})
+    if tool_type == "script":
+        return await execute_script(spec, args, {})
+    raise ValueError(f"Unknown tool type {tool_type}")
 
-# ---------------- Tool registry ----------------
+# -----------------------------------------------------
+# TOOL REGISTRY
+# -----------------------------------------------------
 class ToolRegistry:
-    def __init__(self, spec: Dict[str, Any]):
+    def __init__(self, spec):
         self.spec = spec
-        self.tools: Dict[str, Dict[str, Any]] = {}
-        self._build()
-
-    def _build(self):
-        tools_section = self.spec.get("tools", {})
-        for tool_name, group in tools_section.items():
-
-            # skip non-dict groups
-            if not isinstance(group, dict):
-                continue
-
-            for method_name, method_spec in group.items():
-                # skip group-level description
-                if method_name == "description":
-                    continue
-
-                fullname = f"{tool_name}.{method_name}"
-                safe_spec = self.normalize_method_spec(method_spec)
-                self.tools[fullname] = safe_spec
-
-    def normalize_method_spec(self, raw):
-        if not isinstance(raw, dict):
-            if isinstance(raw, str):
-                return {"description": raw}
-            return {}
-
-        allowed = {
-            "type", "func", "params", "schema", "serializer",
-            "method", "endpoint", "timeout", "path", "description", "id_param"
-        }
-        out = {}
-        for k, v in raw.items():
-            if k in allowed:
-                out[k] = v
-
-        if "params" not in out:
-            out["params"] = raw.get("params", [])
-
-        return out
+        self.tools = spec.get("tools", {})
 
     def list_tools(self):
-        out = {}
-        for fullname, spec in self.tools.items():
-            out[fullname] = {
-                "type": spec.get("type", "python_function"),
-                "func": spec.get("func"),
-                "params": spec.get("params", []),
-                "schema": spec.get("schema"),
-                "serializer": spec.get("serializer"),
-                "description": spec.get("description", "")
-            }
-        return out
+        return self.tools
 
-    def get_tool(self, fullname: str) -> Optional[Dict[str, Any]]:
-        return self.tools.get(fullname)
+    def get_tool(self, name):
+        return self.tools.get(name)
 
     def as_mcp_tools(self):
-        if not MCP_AVAILABLE or mcp_schema is None:
+        if not MCP_AVAILABLE:
             return None
-        mcp_tools = []
-        for fullname, spec in self.tools.items():
-            try:
-                t = mcp_schema.Tool(
-                    name=fullname,
+        result = []
+        for name, spec in self.tools.items():
+            params = spec.get("params", {})
+            result.append(
+                mcp_schema.Tool(
+                    name=name,
                     description=spec.get("description", ""),
-                    parameters=[
-                        mcp_schema.ToolParameter(name=p, description="") for p in spec.get("params", [])
-                    ],
-                    metadata={"type": spec.get("type", "python_function"), "func": spec.get("func")}
+                    parameters=[mcp_schema.ToolParameter(name=p, description="") for p in params.keys()]
                 )
-                mcp_tools.append(t)
-            except Exception:
-                continue
-        return mcp_tools
+            )
+        return result
 
-# ---------------- JSON-RPC helpers ----------------
+# -----------------------------------------------------
+# JSON-RPC HELPERS
+# -----------------------------------------------------
 def rpc_result(msg_id, result):
     return json.dumps({"id": msg_id, "result": result}, default=str)
 
 def rpc_error(msg_id, code, message):
     return json.dumps({"id": msg_id, "error": {"code": code, "message": message}})
 
-# ---------------- WebSocket handler ----------------
-async def ws_handler(websocket, registry: ToolRegistry, server_config: Dict[str, Any]):
-    LOG.info("client connected")
-    try:
-        async for raw in websocket:
-            try:
-                message = json.loads(raw)
-            except Exception:
-                await websocket.send(rpc_error(None, -32700, "Parse error: invalid JSON"))
+# -----------------------------------------------------
+# MCP WS HANDLER
+# -----------------------------------------------------
+async def ws_handler(websocket, registry, spec):
+    LOG.info("Client connected")
+    async for raw in websocket:
+        try:
+            msg = json.loads(raw)
+        except:
+            await websocket.send(rpc_error(None, -32700, "Invalid JSON"))
+            continue
+
+        msg_id = msg.get("id")
+        method = msg.get("method")
+        params = msg.get("params", {})
+
+        if method == "list_tools":
+            tools = registry.as_mcp_tools() or registry.list_tools()
+            await websocket.send(rpc_result(msg_id, tools))
+            continue
+
+        if method == "call_tool":
+            tname = params.get("name")
+            args = params.get("args", {})
+            spec_obj = registry.get_tool(tname)
+            if not spec_obj:
+                await websocket.send(rpc_error(msg_id, -32601, "Tool not found"))
                 continue
-
-            msg_id = message.get("id")
-            method = message.get("method")
-            params = message.get("params", {})
-
-            if not method:
-                await websocket.send(rpc_error(msg_id, -32600, "Missing 'method'"))
-                continue
-
             try:
-                # MCP-standard methods
-                if method == "list_tools":
-                    mcp_tools = registry.as_mcp_tools()
-                    result = mcp_tools if mcp_tools is not None else registry.list_tools()
-                    await websocket.send(rpc_result(msg_id, result))
-                    continue
-
-                if method == "tool_info":
-                    name = params.get("name")
-                    if not name:
-                        await websocket.send(rpc_error(msg_id, -32602, "Missing 'name' param for tool_info"))
-                        continue
-                    spec = registry.get_tool(name)
-                    if not spec:
-                        await websocket.send(rpc_error(msg_id, -32601, f"Tool '{name}' not found"))
-                        continue
-                    await websocket.send(rpc_result(msg_id, spec))
-                    continue
-
-                if method == "call_tool":
-                    name = params.get("name")
-                    args = params.get("args", {})
-                    if not name:
-                        await websocket.send(rpc_error(msg_id, -32602, "Missing 'name' param for call_tool"))
-                        continue
-                    tool_spec = registry.get_tool(name)
-                    if not tool_spec:
-                        await websocket.send(rpc_error(msg_id, -32601, f"Tool '{name}' not found"))
-                        continue
-
-                    ctx = {"logger": LOG, "config": server_config}
-                    try:
-                        result = await execute_tool(tool_spec, args, ctx)
-                        await websocket.send(rpc_result(msg_id, result))
-                    except Exception as e:
-                        LOG.exception("tool execution error")
-                        await websocket.send(rpc_error(msg_id, -32000, f"Tool execution error: {e}"))
-                    continue
-
-                await websocket.send(rpc_error(msg_id, -32601, f"Unknown method '{method}'"))
-            except ConnectionClosedOK:
-                break
+                result = await execute_tool(tname, spec_obj, args, spec)
+                await websocket.send(rpc_result(msg_id, result))
             except Exception as e:
-                LOG.exception("unhandled")
-                await websocket.send(rpc_error(msg_id, -32000, f"Server error: {e}"))
+                await websocket.send(rpc_error(msg_id, -32000, str(e)))
+            continue
 
-    except (ConnectionClosedOK, ConnectionClosedError):
-        LOG.info("client disconnected")
-    except Exception:
-        LOG.exception("ws handler top-level error")
+        await websocket.send(rpc_error(msg_id, -32601, "Unknown method"))
 
-# ---------------- server start helper ----------------
+# -----------------------------------------------------
+# SERVER START — BOOTSTRAPS BACKEND WS FIRST
+# -----------------------------------------------------
 def serve(spec: dict, host="0.0.0.0", port=8765):
+    global BACKEND_URL
+    BACKEND_URL = spec["websocket"]["url"]
+
     registry = ToolRegistry(spec)
-    server_config = spec.get("config", {})
 
-    async def handler(websocket):  # only websocket argument, no path
-        await ws_handler(websocket, registry, server_config)
-
-    async def run_server():
-        LOG.info(f"Starting MCP-style server on ws://{host}:{port} (MCP package available: {MCP_AVAILABLE})")
-        async with websockets.serve(handler, host, port):
-            LOG.info("Server started successfully")
-            await asyncio.Future()  # run forever
+    async def run():
+        # 1️⃣ Connect to backend ONCE
+        await backend_ws_bootstrap()
+        # 2️⃣ Start MCP server
+        LOG.info(f"MCP Server: ws://{host}:{port}")
+        async with websockets.serve(lambda ws: ws_handler(ws, registry, spec), host, port):
+            await asyncio.Future()
 
     try:
-        asyncio.run(run_server())
+        asyncio.run(run())
     except KeyboardInterrupt:
-        LOG.info("Shutting down server")
+        LOG.info("Shutting down MCP server")

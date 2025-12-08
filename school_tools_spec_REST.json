@@ -1,0 +1,139 @@
+{
+  "tools": {
+    "students": {
+      "description": "Tools for managing student records in the school system via REST API endpoints.",
+
+      "create": {
+        "description": "Create a new student record in the system using the provided details.",
+        "type": "external_api",
+        "endpoint": "http://localhost:8000/students/",
+        "method": "POST",
+        "body_params": ["name", "email", "phone", "grade"]
+      },
+
+      "get": {
+        "description": "Fetch details of a specific student using their unique student ID.",
+        "type": "external_api",
+        "endpoint": "http://localhost:8000/students/{student_id}",
+        "method": "GET",
+        "params": ["student_id"]
+      },
+
+      "update": {
+        "description": "Update an existing student's information, such as name, email, phone, grade or fee payment status.",
+        "type": "external_api",
+        "endpoint": "http://localhost:8000/students/{student_id}",
+        "method": "PATCH",
+        "body_params": ["name", "email", "phone", "grade", "fee_paid"],
+        "params": ["student_id"]
+      },
+
+      "delete": {
+        "description": "Remove a student record permanently using their ID.",
+        "type": "external_api",
+        "endpoint": "http://localhost:8000/students/{student_id}",
+        "method": "DELETE",
+        "params": ["student_id"]
+      },
+
+      "list": {
+        "description": "Retrieve a paginated list of all students. Useful for browsing records.",
+        "type": "external_api",
+        "endpoint": "http://localhost:8000/students/",
+        "method": "GET",
+        "params": ["skip", "limit"]
+      },
+
+      "fee_due": {
+        "description": "Get a list of all students who have pending fee payments (fee due = yes).",
+        "type": "external_api",
+        "endpoint": "http://localhost:8000/students/fee_due/",
+        "method": "GET",
+        "params": ["min_due"]
+      },
+
+      "unpaid": {
+        "description": "List all students who have not paid any fees (fee_paid = 0 or false).",
+        "type": "external_api",
+        "endpoint": "http://localhost:8000/students/unpaid/",
+        "method": "GET"
+      },
+
+      "partial_paid": {
+        "description": "List students who have paid part of their fees, but not the full amount.",
+        "type": "external_api",
+        "endpoint": "http://localhost:8000/students/partial_paid/",
+        "method": "GET"
+      },
+
+      "by_grade": {
+        "description": "Retrieve all students belonging to a specific grade/class.",
+        "type": "external_api",
+        "endpoint": "http://localhost:8000/students/grade/{grade}",
+        "method": "GET",
+        "params": ["grade"]
+      }
+    },
+
+    "teachers": {
+      "description": "Tools for managing teacher records via REST API.",
+
+      "create": {
+        "description": "Create a new teacher record with personal and professional details.",
+        "type": "external_api",
+        "endpoint": "http://localhost:8000/teachers/",
+        "method": "POST",
+        "body_params": ["name", "email", "phone", "subject", "salary"]
+      },
+
+      "get": {
+        "description": "Fetch details of a teacher using their unique teacher ID.",
+        "type": "external_api",
+        "endpoint": "http://localhost:8000/teachers/{teacher_id}",
+        "method": "GET",
+        "params": ["teacher_id"]
+      },
+
+      "update": {
+        "description": "Update a teacher's profile including name, contact details, subject, or salary.",
+        "type": "external_api",
+        "endpoint": "http://localhost:8000/teachers/{teacher_id}",
+        "method": "PATCH",
+        "body_params": ["name", "email", "phone", "subject", "salary"],
+        "params": ["teacher_id"]
+      },
+
+      "delete": {
+        "description": "Delete a teacher's record from the system using their ID.",
+        "type": "external_api",
+        "endpoint": "http://localhost:8000/teachers/{teacher_id}",
+        "method": "DELETE",
+        "params": ["teacher_id"]
+      },
+
+      "list": {
+        "description": "Retrieve a paginated list of teachers. Useful for browsing or admin panels.",
+        "type": "external_api",
+        "endpoint": "http://localhost:8000/teachers/",
+        "method": "GET",
+        "params": ["skip", "limit"]
+      },
+
+      "by_salary": {
+        "description": "Fetch teachers filtered by salary comparison. 'op' is a comparison operator like gte, lte; 'amount' is salary value.",
+        "type": "external_api",
+        "endpoint": "http://localhost:8000/teachers/salary/",
+        "method": "GET",
+        "params": ["op", "amount"]
+      },
+
+      "by_grade": {
+        "description": "List all teachers associated with teaching a specific grade/class.",
+        "type": "external_api",
+        "endpoint": "http://localhost:8000/teachers/grade/{grade}",
+        "method": "GET",
+        "params": ["grade"]
+      }
+    }
+  }
+}
