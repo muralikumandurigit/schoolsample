@@ -1,0 +1,5 @@
+python app\mcp_client.py --mcp ws://localhost:8765 --query "How many students in grade 1. I need only from grade 1. ?"
+
+python -m app.start_mcp "C:\Users\sravani k\git\schoolsample\schoolsample\school_tools_spec.json" 
+
+uvicorn app.ws_api:app --reload

@@ -63,42 +63,59 @@ def ws_is_open(ws):
 # BACKEND READER LOOP
 # -----------------------------------------------------
 async def backend_reader_loop():
+    """
+    Persistent backend reader loop.
+    Handles incoming messages from WS_BACKEND and sets futures in WS_PENDING.
+    Reconnects automatically if backend closes.
+    """
     global WS_BACKEND, WS_PENDING
-    ws = WS_BACKEND
+
     LOG.info("Backend reader loop started")
-    try:
-        async for raw in ws:
-            try:
-                msg = json.loads(raw)
-            except Exception:
-                LOG.warning("Non-JSON backend message discarded")
-                continue
 
-            msg_id = msg.get("id")
-            if not msg_id:
-                LOG.warning("Backend message missing id: %s", msg)
-                continue
+    while True:  # keep the reader alive
+        ws = WS_BACKEND
+        if ws is None:
+            LOG.warning("WS_BACKEND is None, waiting for backend to connect...")
+            await asyncio.sleep(1)
+            continue
 
-            fut = WS_PENDING.pop(msg_id, None)
-            if not fut:
-                LOG.warning("Unexpected backend response id=%s", msg_id)
-                continue
+        try:
+            async for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    LOG.warning("Non-JSON backend message discarded")
+                    continue
 
-            if "error" in msg:
-                fut.set_exception(RuntimeError(msg["error"]))
-            else:
-                fut.set_result(msg.get("result"))
+                msg_id = msg.get("id")
+                if not msg_id:
+                    LOG.warning("Backend message missing id: %s", msg)
+                    continue
 
-    except ConnectionClosed:
-        LOG.warning("Backend WS closed")
-    except Exception as e:
-        LOG.exception("Backend reader crashed: %s", e)
-    finally:
-        for mid, fut in list(WS_PENDING.items()):
-            if not fut.done():
-                fut.set_exception(RuntimeError("Backend connection lost"))
-            WS_PENDING.pop(mid, None)
-        LOG.warning("Backend reader loop finished")
+                fut = WS_PENDING.pop(msg_id, None)
+                if not fut:
+                    LOG.warning("Unexpected backend response id=%s", msg_id)
+                    continue
+
+                if "error" in msg:
+                    fut.set_exception(RuntimeError(msg["error"]))
+                else:
+                    fut.set_result(msg.get("result"))
+
+        except ConnectionClosed:
+            LOG.warning("Backend WS closed. Will attempt to reconnect...")
+        except Exception as e:
+            LOG.exception("Backend reader crashed: %s", e)
+        finally:
+            # Fail all pending RPC futures but keep the loop alive
+            for mid, fut in list(WS_PENDING.items()):
+                if not fut.done():
+                    fut.set_exception(RuntimeError("Backend connection lost"))
+                WS_PENDING.pop(mid, None)
+
+            LOG.warning("Backend reader iteration finished. Retrying in 2s...")
+            await asyncio.sleep(2)  # give time before reconnect attempt
+
 
 # -----------------------------------------------------
 # SINGLE BOOTSTRAP CONNECTOR — RUNS AT SERVER START
@@ -127,8 +144,12 @@ async def backend_ws_bootstrap():
 # -----------------------------------------------------
 async def send_backend_rpc(method: str, params: dict, timeout: int = 10):
     global WS_BACKEND
+    # Auto-reconnect if backend WS is closed
     if not ws_is_open(WS_BACKEND):
-        raise RuntimeError("Backend WebSocket not connected")
+        LOG.warning("Backend WS not connected. Attempting to reconnect...")
+        await backend_ws_bootstrap()
+        if not ws_is_open(WS_BACKEND):
+            raise RuntimeError("Backend WebSocket reconnect failed")
 
     msg_id = uuid.uuid4().hex
     fut = asyncio.get_running_loop().create_future()

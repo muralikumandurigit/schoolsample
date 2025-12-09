@@ -349,7 +349,7 @@ async def run_query(ws_uri: str, query: str, model_name: str = "gpt4all-lora-qua
     # 3. Execute plan
     executor = PlanExecutor(mcp)
     exec_result = await executor.execute(plan)
-    print("[client] Execution result:", json.dumps(exec_result, indent=2))
+#    print("[client] Execution result:", json.dumps(exec_result, indent=2))
 
     await mcp.close()
     return exec_result
