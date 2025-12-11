@@ -1,172 +1,185 @@
-"""
-mcp_client.py
-
-Usage:
-    python mcp_client.py --mcp ws://localhost:8765 --query "How many students in grade 1 are still not paid complete fees?"
-
-What this does:
-1. Uses an open-source LLM (gpt4all by default) to turn an English query into a JSON 'plan' of MCP tool calls.
-2. Connects to the MCP websocket server and executes the plan sequentially.
-3. Returns aggregated results and prints them.
-
-Swap LLM backend by editing the `LLM` class (see comments).
-"""
-
 import asyncio
 import json
 import websockets
 import argparse
 import uuid
-import time
-from typing import Any, Dict, List, Optional
-
-# LLM import (gpt4all)
-try:
-    from gpt4all import GPT4All
-    GPT4ALL_AVAILABLE = True
-except Exception:
-    GPT4ALL_AVAILABLE = False
+from typing import Any, Dict, Optional, List
+import ollama
 
 
-# -------------------------
-# Helper: small JSON schema validator for plan
-# -------------------------
+# ============================================================
+#  PLAN VALIDATION
+# ============================================================
 def validate_plan(plan: Dict[str, Any]) -> bool:
-    """
-    Expected plan format:
-    {
-      "plan": [
-        {"tool": "students.by_grade", "args": {"grade": "1"}},
-        {"tool": "students.unpaid", "args": {}},
-        {"merge": "count_unpaid"}   # optional special directive
-      ]
-    }
-    We'll accept list of dicts where each element must have either:
-     - "tool": "<name>", "args": {...}
-     - OR a simple directive such as {"merge": "<key>"}
-
-    Return True if appears ok.
-    """
     if not isinstance(plan, dict):
         return False
+
     steps = plan.get("plan")
     if not isinstance(steps, list):
         return False
+
+    allowed_merge_ops = {"count", "union", "intersect", "difference"}
+
     for s in steps:
         if not isinstance(s, dict):
             return False
+
+        # TOOL STEP
         if "tool" in s:
             if not isinstance(s["tool"], str):
                 return False
             if "args" in s and not isinstance(s["args"], dict):
                 return False
-        else:
-            # allow simple directives like merge or filter
-            allowed_directives = {"merge", "count", "filter"}
-            if not any(k in s for k in allowed_directives):
+            continue
+
+        # MERGE STEP
+        if "merge" in s:
+            if s["merge"] not in allowed_merge_ops:
                 return False
+            continue
+
+        return False
+
     return True
 
 
-# -------------------------
-# LLM wrapper (simple)
-# -------------------------
+# ============================================================
+#  LLM PLANNER
+# ============================================================
 class LLMPlanner:
-    """
-    Simple wrapper around an LLM to convert NL -> JSON plan.
-    Default uses gpt4all if available. To change, modify `generate_plan`.
-    """
 
-    def __init__(self, model_name: str = "gpt4all-lora-quantized"):
+    def __init__(self, model_name="gemma2:9b"):
         self.model_name = model_name
-        self.model = None
-        if GPT4ALL_AVAILABLE:
-            # load the gpt4all model (it will download on first use if needed)
-            try:
-                self.model = GPT4All(self.model_name)
-            except Exception as e:
-                print(f"[LLMPlanner] Warning: GPT4All model load failed: {e}")
-                self.model = None
 
-    def generate_plan(self, prompt_text: str, max_tokens: int = 512) -> Dict[str, Any]:
-        """
-        Ask the LLM to produce a pure JSON plan. The prompt enforces that the model
-        replies with JSON only. If parsing fails, this function raises ValueError.
+    def _user_wants_count(self, query: str) -> bool:
+        q = query.lower()
+        # Basic set of phrases that indicate a count/number request
+        count_triggers = [
+            "how many",
+            "what is the count",
+            "count of",
+            "give me the count",
+            "i need the count",
+            "i need the number",
+            "the number of",
+            "how many are",
+            "how many students",
+            "how many teachers",
+            "just the count",
+            "only the count",
+            "not the list",
+            "only the number",
+            "give only the count",
+            "give only the number",
+        ]
+        return any(trigger in q for trigger in count_triggers)
 
-        Example expected output:
-        {
-          "plan": [
-             {"tool": "students.by_grade", "args": {"grade": "1"}},
-             {"tool": "students.unpaid", "args": {}},
-             {"merge": "count"}
-          ]
-        }
-        """
-        system = (
-            "You are a deterministic planner. Given the user's request, output a JSON object ONLY. "
-            "Do NOT output any extra text. The JSON object must have a top-level 'plan' key, "
-            "whose value is a list of steps. Each step is either:\n"
-            "  - {\"tool\": \"<tool_fullname>\", \"args\": {<args dict>}}\n"
-            "  - or a directive like {\"merge\": \"count\"} or {\"filter\": { ... }}\n\n"
-            "Use the exact tool names available on the MCP server, e.g. 'students.by_grade', 'students.unpaid', 'students.fee_due'. "
-            "If you are unsure of the exact tool names, produce the best guess using dot notation: <group>.<method>.\n\n"
-            "Example output:\n"
-            "{\"plan\": [{\"tool\": \"students.by_grade\", \"args\": {\"grade\": \"1\"}}, {\"tool\": \"students.unpaid\", \"args\": {}}, {\"merge\": \"count\"}]}\n\n"
-            "Now, produce a plan for this user request:\n"
-        )
+    def generate_plan(
+        self,
+        query: str,
+        tools: Dict[str, Any],
+        max_tokens: int = 512
+    ) -> Dict[str, Any]:
 
-        full_prompt = system + prompt_text.strip() + "\n\nJSON:"
-        raw_out = None
+        tools_json = json.dumps(tools, indent=2)
 
-        # prefer GPT4All path if available
-        if self.model is not None:
-            # streaming or simple generation; keep simple
-            try:
-                response = self.model.generate(full_prompt, max_tokens=max_tokens)
-                # model.generate returns string for non-chat models
-                raw_out = response.strip()
-            except Exception as e:
-                raise RuntimeError(f"LLM generation error: {e}")
-        else:
-            # fallback: try a very simple rule-based planner (best-effort)
-            raw_out = self.simple_rule_plan(prompt_text)
+        system_prompt = f"""
+You are an MCP planning engine.
+Your task: convert natural language into a list of MCP tool calls.
 
-        # Some LLMs may include backticks or code fences — strip common wrappers
-        # Keep only first JSON object found
-        json_text = self.extract_first_json(raw_out)
-        if not json_text:
-            raise ValueError(f"LLM did not produce JSON plan. Raw output:\n{raw_out}")
+### RULES ###
+
+1. Output ONLY a JSON object.
+2. Use EXACT tool names from this list (do NOT invent tools):
+{tools_json}
+
+3. Available merge operations (use exactly these):
+   - {{ "merge": "intersect" }}  -> intersection by "id"
+   - {{ "merge": "union" }}
+   - {{ "merge": "difference" }}
+   - {{ "merge": "count" }}
+
+4. Output format:
+{{
+  "plan": [
+     {{ "tool": "<toolname>", "args": {{...}} }},
+     {{ "merge": "intersect" }},
+     {{ "merge": "count" }}
+  ]
+}}
+
+5. Important: If the user's request asks for a number, a count, or explicitly says "not the list" / "just the count", your plan MUST end with {{ "merge": "count" }}.
+6. If the plan contains more than one tool that returns a list,
+   YOU MUST insert exactly one merge step between them.
+
+   Determine the correct merge operator based on the user's language:
+   - Use "intersect" for AND conditions (students who are X AND Y).
+   - Use "union" for OR conditions (students who are X OR Y).
+   - Use "difference" for NOT conditions (students who are X but NOT Y).
+
+   This merge step MUST appear immediately after the second tool call.
+    Example: To find students in grade 3 who have paid full fees:
+    {{
+      "plan": [
+          {{ "tool": "students.by_grade", "args": {{ "grade": 3 }} }},
+          {{ "tool": "students.fullpaid", "args": {{}} }},
+          {{ "merge": "intersect" }}
+      ]
+    }}
+   Never skip this.
+7. Do NOT output any explanation or extra text — ONLY produce valid JSON.
+8. IMPORTANT: For any grade value, output only the number, e.g. "1", "2", "3", NOT "grade 1".
+
+Now produce a plan for the user's query (be concise and deterministic).
+"""
 
         try:
-            plan = json.loads(json_text)
+            response = ollama.chat(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": query},
+                ],
+                options={"num_predict": max_tokens}
+            )
         except Exception as e:
-            raise ValueError(f"Failed to parse JSON from LLM output: {e}\nJSON text:\n{json_text}")
+            raise RuntimeError(f"Ollama error: {e}")
 
+        raw = response["message"]["content"].strip()
+        json_text = self.extract_json(raw)
+
+        if not json_text:
+            raise ValueError(f"Planner did not output JSON:\n{raw}")
+
+        plan = json.loads(json_text)
+
+        # Validate schema first
         if not validate_plan(plan):
-            raise ValueError(f"Plan validation failed. Plan: {plan}")
+            raise ValueError(f"LLM plan schema invalid: {plan}")
+
+        # Enforce count at end if user asked for a count
+        if self._user_wants_count(query):
+            steps = plan.get("plan", [])
+            # If last step is not merge=count, append it
+            if not (isinstance(steps, list) and len(steps) > 0 and isinstance(steps[-1], dict) and steps[-1].get("merge") == "count"):
+                steps.append({"merge": "count"})
+                plan["plan"] = steps
 
         return plan
 
-    def extract_first_json(self, text: str) -> Optional[str]:
-        # naive extraction: find first { ... } matching braces
-        # returns the text from first opening '{' to its matching closing '}'
-        if text is None:
-            return None
-        text = text.strip()
-        # remove ```json fences
+    def extract_json(self, text: str) -> Optional[str]:
         if text.startswith("```"):
-            # strip fence blocks
-            for fence in ["```json", "```"]:
-                if text.startswith(fence):
-                    text = text[len(fence):].strip()
-                    if text.endswith("```"):
-                        text = text[:-3].strip()
-                    break
-        # find first '{'
+            if text.startswith("```json"):
+                text = text[7:].strip()
+            else:
+                text = text[3:].strip()
+            if text.endswith("```"):
+                text = text[:-3]
+
         start = text.find("{")
         if start == -1:
             return None
-        # match braces
+
         depth = 0
         for i in range(start, len(text)):
             if text[i] == "{":
@@ -177,44 +190,20 @@ class LLMPlanner:
                     return text[start:i+1]
         return None
 
-    def simple_rule_plan(self, query: str) -> str:
-        """
-        Fallback simple planner for trivial queries.
-        This is not robust; use only if LLM not available.
-        """
-        q = query.lower()
-        if "grade" in q or "class" in q:
-            # try to extract a grade number
-            import re
-            m = re.search(r"grade\s*([0-9]+)", q)
-            grade = m.group(1) if m else ""
-            # Many school specs: to count unpaid students in grade X: call by_grade -> unpaid -> merge count
-            plan = {
-                "plan": [
-                    {"tool": "students.by_grade", "args": {"grade": grade}},
-                    {"tool": "students.unpaid", "args": {}},
-                    {"merge": "count"}
-                ]
-            }
-            return json.dumps(plan)
-        # generic fallback: ask for list of unpaid
-        plan = {"plan": [{"tool": "students.unpaid", "args": {}}, {"merge": "count"}]}
-        return json.dumps(plan)
 
-
-# -------------------------
-# MCP WebSocket client helpers
-# -------------------------
+# ============================================================
+#  MCP CLIENT (WebSocket)
+# ============================================================
 class MCPClient:
-    def __init__(self, ws_uri: str, timeout: int = 10):
+
+    def __init__(self, ws_uri: str, timeout=10):
         self.ws_uri = ws_uri
         self.timeout = timeout
         self._conn = None
-        self._resp_futures = {}  # id -> future
+        self._pending = {}
 
     async def connect(self):
         self._conn = await websockets.connect(self.ws_uri)
-        # start receiver task
         asyncio.create_task(self._receiver())
 
     async def close(self):
@@ -222,148 +211,249 @@ class MCPClient:
             await self._conn.close()
 
     async def _receiver(self):
-        # receive messages and dispatch to awaiting futures
         try:
             async for raw in self._conn:
                 try:
                     msg = json.loads(raw)
-                except Exception:
+                except:
                     continue
+
                 msg_id = msg.get("id")
-                if msg_id and msg_id in self._resp_futures:
-                    fut = self._resp_futures.pop(msg_id)
+                if msg_id in self._pending:
+                    fut = self._pending.pop(msg_id)
                     if "result" in msg:
                         fut.set_result(msg["result"])
                     else:
-                        fut.set_exception(Exception(msg.get("error") or "Unknown RPC error"))
-        except Exception:
+                        fut.set_exception(Exception(msg.get("error")))
+        except:
             pass
 
-    async def _rpc(self, method: str, params: dict) -> Any:
-        if not self._conn:
-            raise RuntimeError("Not connected")
+    async def _rpc(self, method: str, params: dict):
         msg_id = str(uuid.uuid4())
-        payload = {"id": msg_id, "method": method, "params": params}
         fut = asyncio.get_running_loop().create_future()
-        self._resp_futures[msg_id] = fut
-        await self._conn.send(json.dumps(payload))
-        # wait for response or timeout
-        try:
-            return await asyncio.wait_for(fut, timeout=self.timeout)
-        except asyncio.TimeoutError:
-            if msg_id in self._resp_futures:
-                self._resp_futures.pop(msg_id, None)
-            raise
+        self._pending[msg_id] = fut
 
-    async def list_tools(self) -> Any:
+        payload = {"id": msg_id, "method": method, "params": params}
+        await self._conn.send(json.dumps(payload))
+
+        return await asyncio.wait_for(fut, timeout=self.timeout)
+
+    async def list_tools(self):
         return await self._rpc("list_tools", {})
 
-    async def tool_info(self, name: str) -> Any:
-        return await self._rpc("tool_info", {"name": name})
-
-    async def call_tool(self, name: str, args: dict) -> Any:
+    async def call_tool(self, name: str, args: dict):
         return await self._rpc("call_tool", {"name": name, "args": args})
 
 
-# -------------------------
-# Plan Executor
-# -------------------------
+# ============================================================
+#  PLAN EXECUTOR (WITH CORRECT MERGE LOGIC)
+# ============================================================
 class PlanExecutor:
-    def __init__(self, mcp_client: MCPClient):
-        self.mcp = mcp_client
+
+    def __init__(self, mcp: MCPClient):
+        self.mcp = mcp
+
+    def _index_by_id(self, lst):
+        return {item["id"]: item for item in lst if isinstance(item, dict) and "id" in item}
+
+    # ---- merge operations ----
+    def merge_intersect(self, results: List[List[dict]]):
+        if len(results) < 2:
+            return results[-1] if results else []
+
+        maps = [self._index_by_id(r) for r in results]
+
+        common_ids = set(maps[0].keys())
+        for m in maps[1:]:
+            common_ids &= set(m.keys())
+
+        # return items from the first map in deterministic order
+        return [maps[0][i] for i in common_ids]
+
+    def merge_union(self, results: List[List[dict]]):
+        merged = {}
+        for r in results:
+            for item in r:
+                if "id" in item:
+                    merged[item["id"]] = item
+        return list(merged.values())
+
+    def merge_difference(self, a, b):
+        amap = self._index_by_id(a)
+        bmap = self._index_by_id(b)
+        diff = [v for k, v in amap.items() if k not in bmap]
+        return diff
 
     async def execute(self, plan: Dict[str, Any]) -> Dict[str, Any]:
         steps = plan.get("plan", [])
-        context = {"last": None}
-        results = []
-        for step in steps:
-            if "tool" in step:
-                tool_name = step["tool"]
-                args = step.get("args", {}) or {}
-                # If args refer to placeholders like {grade_from_prev}, you could replace them here
-                # For now we support direct args only.
-                try:
-                    res = await self.mcp.call_tool(tool_name, args)
-                except Exception as e:
-                    return {"error": f"Tool call '{tool_name}' failed: {e}"}
-                context["last"] = res
-                results.append({"tool": tool_name, "result": res})
+        tool_results: List[List[Dict[str, Any]]] = []      # stores results of each TOOL call (lists)
+        context_last: Any = None
+
+        # pending merges that couldn't be applied yet because not enough tool results existed
+        pending_merges: List[str] = []
+
+        def _apply_merge_op(op: str):
+            nonlocal tool_results, context_last
+            if op == "intersect":
+                merged = self.merge_intersect(tool_results)
+                tool_results = [merged]
+                context_last = merged
+            elif op == "union":
+                merged = self.merge_union(tool_results)
+                tool_results = [merged]
+                context_last = merged
+            elif op == "difference":
+                if len(tool_results) < 2:
+                    # cannot apply difference yet
+                    return False
+                merged = self.merge_difference(tool_results[0], tool_results[1])
+                tool_results = [merged]
+                context_last = merged
             else:
-                # handle directive e.g. merge/count
-                if "merge" in step and step["merge"] == "count":
-                    # If last result is a list, count; else try to sum counts from previous results
-                    last = context.get("last")
-                    if isinstance(last, list):
-                        cnt = len(last)
-                        results.append({"merge": "count", "value": cnt})
-                        context["last"] = cnt
+                raise ValueError(f"Unknown deferred merge op {op}")
+            return True
+
+        for step in steps:
+
+            # --------------------------------------------
+            # TOOL CALL
+            # --------------------------------------------
+            if "tool" in step:
+                tool = step["tool"]
+                args = step.get("args", {})
+                res = await self.mcp.call_tool(tool, args)
+
+                # Accept empty list as valid
+                if not isinstance(res, list):
+                    raise ValueError(f"Tool {tool} must return a list, got: {res}")
+
+                tool_results.append(res)
+                context_last = res
+
+                # After adding a new tool result, try to apply any pending merges
+                # as long as they can be applied (i.e., enough results exist).
+                applied_any = True
+                while pending_merges and applied_any:
+                    applied_any = False
+                    # Check first pending merge if it's now applicable
+                    next_op = pending_merges[0]
+                    # For intersect/union we need at least 2 prior tool results
+                    if next_op in ("intersect", "union", "difference"):
+                        if len(tool_results) >= 2:
+                            pending_merges.pop(0)
+                            _apply_merge_op(next_op)
+                            applied_any = True
                     else:
-                        # attempt to derive count from results array (sum list lengths)
-                        total = 0
-                        for r in results:
-                            v = r.get("result")
-                            if isinstance(v, list):
-                                total += len(v)
-                        results.append({"merge": "count", "value": total})
-                        context["last"] = total
-                elif "merge" in step and step["merge"] == "unique":
-                    # example: flatten lists and get unique by id
-                    all_items = []
-                    for r in results:
-                        v = r.get("result")
-                        if isinstance(v, list):
-                            all_items.extend(v)
-                    # assume each item has 'id'
-                    uniq = {item.get("id", idx): item for idx, item in enumerate(all_items)}
-                    vals = list(uniq.values())
-                    results.append({"merge": "unique", "value": vals})
-                    context["last"] = vals
+                        # shouldn't be other ops here
+                        pending_merges.pop(0)
+                        applied_any = False
+
+                continue
+
+            # --------------------------------------------
+            # MERGE OPERATIONS
+            # --------------------------------------------
+            if "merge" in step:
+                op = step["merge"]
+
+                # If op requires at least 2 prior tool results but we don't have them yet,
+                # defer the merge until more tool results have been collected.
+                if op in ("intersect", "union", "difference"):
+                    if len(tool_results) < 2:
+                        # Defer it
+                        pending_merges.append(op)
+                        # Do not change context_last now; it will be updated when applied.
+                        continue
+                    else:
+                        # apply immediately
+                        merged = None
+                        if op == "intersect":
+                            merged = self.merge_intersect(tool_results)
+                        elif op == "union":
+                            merged = self.merge_union(tool_results)
+                        elif op == "difference":
+                            merged = self.merge_difference(tool_results[0], tool_results[1])
+                        tool_results = [merged]
+                        context_last = merged
+                        continue
+
+                elif op == "count":
+                    # Before counting, try to apply any pending merges (if possible)
+                    while pending_merges:
+                        next_op = pending_merges[0]
+                        if next_op in ("intersect", "union", "difference") and len(tool_results) < 2:
+                            # cannot apply now; break out and count current available result
+                            break
+                        # apply
+                        pending_merges.pop(0)
+                        _apply_merge_op(next_op)
+
+                    # Now perform the count on the most recent logical result:
+                    if isinstance(context_last, list):
+                        context_last = len(context_last)
+                    else:
+                        if tool_results and isinstance(tool_results[-1], list):
+                            context_last = len(tool_results[-1])
+                        else:
+                            context_last = 0
+                    # After count, we keep tool_results as-is (context_last is an int)
+                    continue
+
                 else:
-                    # unsupported directive - ignore or return error
-                    results.append({"directive": step, "error": "unsupported directive"})
-        return {"results": results, "final": context.get("last")}
+                    raise ValueError(f"Unknown merge op {op}")
+
+        # If plan ended but some pending merges remain and are applicable, try to apply them
+        while pending_merges:
+            next_op = pending_merges[0]
+            if next_op in ("intersect", "union", "difference") and len(tool_results) < 2:
+                # cannot apply further
+                break
+            pending_merges.pop(0)
+            _apply_merge_op(next_op)
+
+        return {
+            "final": context_last
+        }
 
 
-# -------------------------
-# CLI / orchestrator
-# -------------------------
-async def run_query(ws_uri: str, query: str, model_name: str = "gpt4all-lora-quantized"):
-    # 1. LLM plan
-    planner = LLMPlanner(model_name=model_name)
-    print("[client] Generating plan from LLM...")
-    plan = planner.generate_plan(query)
-    print("[client] Plan:", json.dumps(plan, indent=2))
+# ============================================================
+#  ORCHESTRATOR
+# ============================================================
+async def run_query(ws_uri: str, query: str, model_name: str):
 
-    # 2. Connect MCP
     mcp = MCPClient(ws_uri)
     await mcp.connect()
-    print("[client] Connected to MCP:", ws_uri)
+    print("[client] Connected to MCP server.")
 
-    # optional: list tools (for debugging)
-    try:
-        tools = await mcp.list_tools()
-        print("[client] Tools available (sample):", list(tools.keys())[:10])
-    except Exception as e:
-        print("[client] Could not list tools:", e)
+    tools_list = await mcp.list_tools()
+    raw_tools = tools_list.get("tools", {})  # dict of tool_name → tool_info
+    tools = {
+        tool_name: {"description": tool_info.get("description", "")}
+        for tool_name, tool_info in raw_tools.items()
+    }
+    print("[client] Tools discovered:", json.dumps(tools, indent=2))
 
-    # 3. Execute plan
+
+    planner = LLMPlanner(model_name=model_name)
+    plan = planner.generate_plan(query, tools)
+    print("[client] LLM Plan:", json.dumps(plan, indent=2))
+
     executor = PlanExecutor(mcp)
-    exec_result = await executor.execute(plan)
-#    print("[client] Execution result:", json.dumps(exec_result, indent=2))
+    result = await executor.execute(plan)
 
     await mcp.close()
-    return exec_result
+    return result
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mcp", required=True, help="MCP websocket URL (e.g. ws://localhost:8765)")
-    parser.add_argument("--query", required=True, help="Natural language query")
-    parser.add_argument("--model", default="gpt4all-lora-quantized", help="LLM model name (gpt4all)")
+    parser.add_argument("--mcp", required=True)
+    parser.add_argument("--query", required=True)
+    parser.add_argument("--model", default="gemma2:9b")
     args = parser.parse_args()
 
-    result = asyncio.run(run_query(args.mcp, args.query, model_name=args.model))
-    print("FINAL:", json.dumps(result, indent=2))
+    out = asyncio.run(run_query(args.mcp, args.query, args.model))
+    print("\nFINAL:", json.dumps(out, indent=2))
 
 
 if __name__ == "__main__":

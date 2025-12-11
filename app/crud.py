@@ -49,6 +49,8 @@ def students_partial_paid(db: Session) -> List[models.Student]:
 def students_by_grade(db: Session, grade: int) -> List[models.Student]:
     return db.query(models.Student).filter(models.Student.grade == grade).all()
 
+def students_fullpaid(db: Session) -> List[models.Student]:
+    return db.query(models.Student).filter(models.Student.fee_paid >= models.Student.fee_total).all()
 
 # ---------- TEACHER CRUD ----------
 def create_teacher(db: Session, teacher: schemas.TeacherCreate) -> models.Teacher:

@@ -70,6 +70,14 @@
         "params": []
       },
 
+      "fullpaid": {
+        "description": "List students who have paid all their fees.",
+        "type": "python_function",
+        "func": "crud.students_fullpaid",
+        "serializer": "serialize_student",
+        "params": []
+      },
+      
       "by_grade": {
         "description": "Retrieve all students belonging to a specific grade/class.",
         "type": "python_function",

@@ -61,6 +61,12 @@
       "params": {}
     },
 
+    "students.fullpaid": {
+      "description": "List students who have paid all their fees.",
+      "type": "websocket",
+      "params": {}
+    },
+    
     "students.unpaid": {
       "description": "List students who have not paid any fees.",
       "type": "websocket",

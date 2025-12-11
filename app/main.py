@@ -60,6 +60,10 @@ def unpaid_students(database: Session = Depends(get_db)):
 def partial_paid_students(database: Session = Depends(get_db)):
     return crud.students_partial_paid(database)
 
+@app.get("/students/fullpaid/", response_model=list[schemas.StudentOut])
+def fullpaid_students(database: Session = Depends(get_db)):
+    return crud.students_fullpaid(database)
+
 @app.get("/students/grade/{grade}", response_model=list[schemas.StudentOut])
 def students_in_grade(grade: int, database: Session = Depends(get_db)):
     return crud.students_by_grade(database, grade)

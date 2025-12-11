@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 
 import websockets
 from websockets.exceptions import ConnectionClosed
+from websockets.protocol import State
 
 # Optional MCP
 try:
@@ -29,7 +30,7 @@ LOG = logging.getLogger("generic_mcp_server_mcp")
 logging.basicConfig(level=logging.INFO)
 
 # -----------------------------------------------------
-# DB SESSION SCOPE
+# DB SESSION
 # -----------------------------------------------------
 @contextmanager
 def db_session_scope():
@@ -50,117 +51,112 @@ def load_python_callable(path: str):
 WS_BACKEND: Optional[websockets.WebSocketClientProtocol] = None
 WS_READER_TASK: Optional[asyncio.Task] = None
 WS_PENDING: Dict[str, asyncio.Future] = {}
-WS_LOCK = asyncio.Lock()
 BACKEND_URL: Optional[str] = None
 
-# -----------------------------------------------------
-# HELPER: CHECK IF WS IS OPEN (websockets v12+)
-# -----------------------------------------------------
-def ws_is_open(ws):
-    return ws is not None and ws.state == websockets.protocol.State.OPEN
 
 # -----------------------------------------------------
-# BACKEND READER LOOP
+# WS STATE CHECK
+# -----------------------------------------------------
+def ws_is_open(ws):
+    return ws is not None and ws.state == State.OPEN
+
+
+# -----------------------------------------------------
+# BACKEND READER LOOP (THE ONLY recv())
 # -----------------------------------------------------
 async def backend_reader_loop():
     """
-    Persistent backend reader loop.
-    Handles incoming messages from WS_BACKEND and sets futures in WS_PENDING.
-    Reconnects automatically if backend closes.
+    Only place in the entire server that calls ws.recv().
+    Reads backend responses and resolves matching futures.
     """
     global WS_BACKEND, WS_PENDING
 
     LOG.info("Backend reader loop started")
 
-    while True:  # keep the reader alive
+    while True:
         ws = WS_BACKEND
-        if ws is None:
-            LOG.warning("WS_BACKEND is None, waiting for backend to connect...")
+        if ws is None or not ws_is_open(ws):
             await asyncio.sleep(1)
             continue
 
         try:
-            async for raw in ws:
-                try:
-                    msg = json.loads(raw)
-                except Exception:
-                    LOG.warning("Non-JSON backend message discarded")
-                    continue
-
-                msg_id = msg.get("id")
-                if not msg_id:
-                    LOG.warning("Backend message missing id: %s", msg)
-                    continue
-
-                fut = WS_PENDING.pop(msg_id, None)
-                if not fut:
-                    LOG.warning("Unexpected backend response id=%s", msg_id)
-                    continue
-
-                if "error" in msg:
-                    fut.set_exception(RuntimeError(msg["error"]))
-                else:
-                    fut.set_result(msg.get("result"))
-
+            raw = await ws.recv()  # THE ONLY .recv()
         except ConnectionClosed:
-            LOG.warning("Backend WS closed. Will attempt to reconnect...")
+            LOG.warning("Backend WS closed. Reader will retry.")
+            await asyncio.sleep(2)
+            continue
         except Exception as e:
-            LOG.exception("Backend reader crashed: %s", e)
-        finally:
-            # Fail all pending RPC futures but keep the loop alive
-            for mid, fut in list(WS_PENDING.items()):
-                if not fut.done():
-                    fut.set_exception(RuntimeError("Backend connection lost"))
-                WS_PENDING.pop(mid, None)
+            LOG.error(f"Backend reader error: {e}")
+            await asyncio.sleep(2)
+            continue
 
-            LOG.warning("Backend reader iteration finished. Retrying in 2s...")
-            await asyncio.sleep(2)  # give time before reconnect attempt
+        # Handle incoming message
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            LOG.warning("Non-JSON backend message ignored.")
+            continue
+
+        msg_id = msg.get("id")
+        if not msg_id:
+            LOG.warning("Backend message missing id: %s", msg)
+            continue
+
+        fut = WS_PENDING.pop(msg_id, None)
+        if not fut:
+            LOG.warning("Unexpected backend response id=%s", msg_id)
+            continue
+
+        if "error" in msg:
+            fut.set_exception(RuntimeError(msg["error"]))
+        else:
+            fut.set_result(msg.get("result"))
 
 
 # -----------------------------------------------------
-# SINGLE BOOTSTRAP CONNECTOR — RUNS AT SERVER START
+# SINGLE STARTUP CONNECTOR
 # -----------------------------------------------------
 async def backend_ws_bootstrap():
     """
-    Connect once at server startup and keep WS + reader running.
-    Auto-reconnects on drop.
+    Connects ONCE at server start, launches the single reader task.
+    Reconnect logic is handled lazily in RPC calls.
     """
     global WS_BACKEND, WS_READER_TASK, BACKEND_URL
-    assert BACKEND_URL, "BACKEND_URL not set"
 
     while True:
         try:
             LOG.info(f"[BOOT] Connecting to backend WebSocket: {BACKEND_URL}")
             WS_BACKEND = await websockets.connect(BACKEND_URL)
             WS_READER_TASK = asyncio.create_task(backend_reader_loop())
-            LOG.info("[BOOT] Backend connected successfully")
+            LOG.info("[BOOT] Backend connected")
             return
         except Exception as e:
-            LOG.error(f"[BOOT] Backend connect failed: {e}; retrying in 3s…")
+            LOG.error(f"[BOOT] Backend connect failed: {e}, retrying in 3s")
             await asyncio.sleep(3)
 
+
 # -----------------------------------------------------
-# SEND RPC TO BACKEND WS
+# SEND RPC (no recv here!)
 # -----------------------------------------------------
 async def send_backend_rpc(method: str, params: dict, timeout: int = 10):
     global WS_BACKEND
-    # Auto-reconnect if backend WS is closed
+
+    # Lazy reconnect if needed
     if not ws_is_open(WS_BACKEND):
-        LOG.warning("Backend WS not connected. Attempting to reconnect...")
+        LOG.warning("Backend WS not connected. Attempting reconnect...")
         await backend_ws_bootstrap()
-        if not ws_is_open(WS_BACKEND):
-            raise RuntimeError("Backend WebSocket reconnect failed")
 
     msg_id = uuid.uuid4().hex
     fut = asyncio.get_running_loop().create_future()
     WS_PENDING[msg_id] = fut
-    rpc_msg = {"id": msg_id, "method": method, "params": params}
+
+    msg = {"id": msg_id, "method": method, "params": params}
 
     try:
-        await WS_BACKEND.send(json.dumps(rpc_msg))
+        await WS_BACKEND.send(json.dumps(msg))
     except Exception as e:
         WS_PENDING.pop(msg_id, None)
-        raise RuntimeError(f"Send failed: {e}")
+        raise RuntimeError(f"WS send failed: {e}")
 
     try:
         return await asyncio.wait_for(fut, timeout=timeout)
@@ -168,18 +164,17 @@ async def send_backend_rpc(method: str, params: dict, timeout: int = 10):
         WS_PENDING.pop(msg_id, None)
         raise
 
+
 # -----------------------------------------------------
-# EXECUTE TOOL
+# TOOL EXECUTION
 # -----------------------------------------------------
 async def execute_python_function(spec, args, ctx):
     fn = load_python_callable(spec["func"])
-    kwargs = args.copy()
     try:
         if inspect.iscoroutinefunction(fn):
-            return await fn(**kwargs)
-        else:
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, lambda: fn(**kwargs))
+            return await fn(**args)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: fn(**args))
     except Exception as e:
         raise RuntimeError(f"python error: {e}")
 
@@ -195,15 +190,16 @@ async def execute_script(spec, args, ctx):
         return proc.stdout
 
 async def execute_tool(name, spec, args, root_spec):
-    tool_type = spec.get("type")
-    if tool_type == "websocket":
+    t = spec.get("type")
+    if t == "websocket":
         timeout = spec.get("timeout", 10)
         return await send_backend_rpc(name, args, timeout)
-    if tool_type == "python_function":
+    if t == "python_function":
         return await execute_python_function(spec, args, {})
-    if tool_type == "script":
+    if t == "script":
         return await execute_script(spec, args, {})
-    raise ValueError(f"Unknown tool type {tool_type}")
+    raise ValueError(f"Unknown tool type: {t}")
+
 
 # -----------------------------------------------------
 # TOOL REGISTRY
@@ -214,7 +210,7 @@ class ToolRegistry:
         self.tools = spec.get("tools", {})
 
     def list_tools(self):
-        return self.tools
+        return self.spec
 
     def get_tool(self, name):
         return self.tools.get(name)
@@ -222,20 +218,21 @@ class ToolRegistry:
     def as_mcp_tools(self):
         if not MCP_AVAILABLE:
             return None
-        result = []
+        res = []
         for name, spec in self.tools.items():
             params = spec.get("params", {})
-            result.append(
+            res.append(
                 mcp_schema.Tool(
                     name=name,
                     description=spec.get("description", ""),
                     parameters=[mcp_schema.ToolParameter(name=p, description="") for p in params.keys()]
                 )
             )
-        return result
+        return res
+
 
 # -----------------------------------------------------
-# JSON-RPC HELPERS
+# RPC HELPERS
 # -----------------------------------------------------
 def rpc_result(msg_id, result):
     return json.dumps({"id": msg_id, "result": result}, default=str)
@@ -243,11 +240,13 @@ def rpc_result(msg_id, result):
 def rpc_error(msg_id, code, message):
     return json.dumps({"id": msg_id, "error": {"code": code, "message": message}})
 
+
 # -----------------------------------------------------
-# MCP WS HANDLER
+# MCP SERVER WS HANDLER
 # -----------------------------------------------------
 async def ws_handler(websocket, registry, spec):
     LOG.info("Client connected")
+
     async for raw in websocket:
         try:
             msg = json.loads(raw)
@@ -259,11 +258,13 @@ async def ws_handler(websocket, registry, spec):
         method = msg.get("method")
         params = msg.get("params", {})
 
+        # ---------------- list_tools ----------------
         if method == "list_tools":
             tools = registry.as_mcp_tools() or registry.list_tools()
             await websocket.send(rpc_result(msg_id, tools))
             continue
 
+        # ---------------- call_tool ----------------
         if method == "call_tool":
             tname = params.get("name")
             args = params.get("args", {})
@@ -280,20 +281,19 @@ async def ws_handler(websocket, registry, spec):
 
         await websocket.send(rpc_error(msg_id, -32601, "Unknown method"))
 
+
 # -----------------------------------------------------
-# SERVER START — BOOTSTRAPS BACKEND WS FIRST
+# SERVER START
 # -----------------------------------------------------
 def serve(spec: dict, host="0.0.0.0", port=8765):
     global BACKEND_URL
-    BACKEND_URL = spec["websocket"]["url"]
 
+    BACKEND_URL = spec["websocket"]["url"]
     registry = ToolRegistry(spec)
 
     async def run():
-        # 1️⃣ Connect to backend ONCE
-        await backend_ws_bootstrap()
-        # 2️⃣ Start MCP server
-        LOG.info(f"MCP Server: ws://{host}:{port}")
+        await backend_ws_bootstrap()  # connect once
+        LOG.info(f"MCP Server running on ws://{host}:{port}")
         async with websockets.serve(lambda ws: ws_handler(ws, registry, spec), host, port):
             await asyncio.Future()
 

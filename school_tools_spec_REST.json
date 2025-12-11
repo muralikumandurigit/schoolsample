@@ -66,6 +66,13 @@
         "method": "GET"
       },
 
+      "fullpaid": {
+        "description": "List students who have paid all their fees.",
+        "type": "external_api",
+        "endpoint": "http://localhost:8000/students/fullpaid/",
+        "method": "GET"
+      },
+
       "by_grade": {
         "description": "Retrieve all students belonging to a specific grade/class.",
         "type": "external_api",

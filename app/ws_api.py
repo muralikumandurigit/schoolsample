@@ -54,6 +54,7 @@ ENTITY_MAP = {
         "unpaid": (crud.students_unpaid, serialize_student, None),
         "partial_paid": (crud.students_partial_paid, serialize_student, None),
         "by_grade": (crud.students_by_grade, serialize_student, None),
+        "fullpaid": (crud.students_fullpaid, serialize_student, None),
     },
     "teachers": {
         "create": (crud.create_teacher, serialize_teacher, schemas.TeacherCreate),
@@ -97,7 +98,7 @@ async def websocket_handler(ws: WebSocket):
                         data = schema_cls(**params) if action == "create" else schema_cls(**params.get("updates", {}))
                         result = func(db_session, data)
                     # Handle list and queries
-                    elif action in ("list", "fee_due", "unpaid", "partial_paid", "by_grade", "by_salary"):
+                    elif action in ("list", "fee_due", "unpaid", "partial_paid", "by_grade", "by_salary", "fullpaid"):
                         if method == "teachers.by_salary":
                             op = params.get("op", "gte")
                             amount = params.get("amount", 0.0)
