@@ -48,7 +48,7 @@ def validate_plan(plan: Dict[str, Any]) -> bool:
 # ============================================================
 class LLMPlanner:
 
-    def __init__(self, model_name="gemma2:9b"):
+    def __init__(self, model_name="qwen2.5:7b"):
         self.model_name = model_name
 
     def _user_wants_count(self, query: str) -> bool:
@@ -102,7 +102,7 @@ Your task: convert natural language into a list of MCP tool calls.
 4. Output format:
 {{
   "plan": [
-     {{ "tool": "<toolname>", "args": {{...}} }},
+     {{ "tool": "<toolname>", "args": {{...}} }} ,
      {{ "merge": "intersect" }},
      {{ "merge": "count" }}
   ]
@@ -228,21 +228,69 @@ class MCPClient:
         except:
             pass
 
+    # --- PATCH: Graceful error handling start ---
     async def _rpc(self, method: str, params: dict):
+        """
+        Safe RPC wrapper:
+         - registers a pending future
+         - sends the payload
+         - waits for result with timeout
+         - on timeout / cancelled / send error returns structured {"error": "..."}
+         - always cleans up pending future
+        """
         msg_id = str(uuid.uuid4())
         fut = asyncio.get_running_loop().create_future()
         self._pending[msg_id] = fut
 
         payload = {"id": msg_id, "method": method, "params": params}
-        await self._conn.send(json.dumps(payload))
 
-        return await asyncio.wait_for(fut, timeout=self.timeout)
+        # Attempt to send; if send fails, clean up and return structured error
+        try:
+            await self._conn.send(json.dumps(payload))
+        except Exception as e:
+            # remove pending and return an error object
+            self._pending.pop(msg_id, None)
+            return {"error": f"Failed to send request: {e}"}
 
+        # Wait for response but handle timeout / cancelled and other exceptions
+        try:
+            return await asyncio.wait_for(fut, timeout=self.timeout)
+        except asyncio.TimeoutError:
+            self._pending.pop(msg_id, None)
+            return {"error": f"Timeout: MCP server did not respond to method '{method}' within {self.timeout}s"}
+        except asyncio.CancelledError:
+            self._pending.pop(msg_id, None)
+            return {"error": f"Cancelled: MCP request '{method}' was cancelled"}
+        except Exception as e:
+            self._pending.pop(msg_id, None)
+            return {"error": f"Unexpected RPC error: {e}"}
+    # --- PATCH: Graceful error handling end ---
+
+    # --- PATCH: Graceful error handling start ---
     async def list_tools(self):
-        return await self._rpc("list_tools", {})
+        """
+        Wrapper around _rpc for list_tools.
+        Returns a dict with "tools" key on success, or {"tools": {}, "error": "..."} on failure.
+        This keeps existing callers that do tools_list.get("tools", {}) working unchanged.
+        """
+        res = await self._rpc("list_tools", {})
+        if isinstance(res, dict) and "error" in res:
+            return {"tools": {}, "error": res["error"]}
+        return res
+    # --- PATCH: Graceful error handling end ---
 
+    # --- PATCH: Graceful error handling start ---
     async def call_tool(self, name: str, args: dict):
-        return await self._rpc("call_tool", {"name": name, "args": args})
+        """
+        Call a tool safely. If RPC returns an error object, print it and return an empty list
+        (executor expects a list). This prevents the whole client from crashing on timeouts.
+        """
+        res = await self._rpc("call_tool", {"name": name, "args": args})
+        if isinstance(res, dict) and "error" in res:
+            print(f"[client] Tool error calling '{name}': {res['error']}")
+            return []
+        return res
+    # --- PATCH: Graceful error handling end ---
 
 
 # ============================================================
@@ -439,7 +487,13 @@ async def run_query(ws_uri: str, query: str, model_name: str):
     print("[client] LLM Plan:", json.dumps(plan, indent=2))
 
     executor = PlanExecutor(mcp)
-    result = await executor.execute(plan)
+    # --- PATCH: Graceful error handling start ---
+    try:
+        result = await executor.execute(plan)
+    except Exception as e:
+        # preserve behaviour: don't crash the CLI — return structured error
+        result = {"error": f"Executor failed: {e}"}
+    # --- PATCH: Graceful error handling end ---
 
     await mcp.close()
     return result
@@ -449,7 +503,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mcp", required=True)
     parser.add_argument("--query", required=True)
-    parser.add_argument("--model", default="gemma2:9b")
+    parser.add_argument("--model", default="qwen2.5:7b")
     args = parser.parse_args()
 
     out = asyncio.run(run_query(args.mcp, args.query, args.model))
